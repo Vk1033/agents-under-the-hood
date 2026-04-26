@@ -1,12 +1,13 @@
-import json
 import os
+import re
 from openai import OpenAI
 from langsmith import traceable
 from dotenv import load_dotenv
+import inspect
 load_dotenv()
 
 MAX_ITERATIONS = 5
-model = "nvidia/nemotron-3-super-120b-a12b-20230311:free"
+model = "openai/gpt-oss-120b:free"
 
 llm=OpenAI(
     base_url="https://openrouter.ai/api/v1",
@@ -32,106 +33,110 @@ def apply_discount(price: float, discount_tier: str) -> float:
         "silver": 10,
         "gold": 15,
     }
+    price=float(price)
     discount_percentage = discount_tiers.get(discount_tier, 0)
     return round(price * (1 - discount_percentage / 100), 2)
 
-tools_for_llm = [
-    {
-        "type": "function",
-        "function": {
-            "name": "get_product_price",
-            "description": "Look up the price of a product in a catalog.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "product_name": {
-                        "type": "string",
-                        "description": "The product name, e.g. 'laptop', 'headphones', 'keyboard'",
-                    },
-                },
-                "required": ["product_name"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "apply_discount",
-            "description": """Apply a discount to a price.
-    Available tiers: bronze (5%), silver (10%), gold (15%)""",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "price": {"type": "number", "description": "The original price"},
-                    "discount_tier": {
-                        "type": "string",
-                        "description": "The discount tier: 'bronze', 'silver', or 'gold'",
-                    },
-                },
-                "required": ["price", "discount_tier"],
-            },
-        },
-    },
-]
-
-@traceable(name="Nematron chat",run_type="llm")
-def nematron_chat_traced(messages):
-    return llm.chat.completions.create(
-    model="nvidia/nemotron-3-super-120b-a12b:free",
-    messages=messages,
-    tools=tools_for_llm,
-)
-
-@traceable(name="Nematron Agent Loop")
-def run_agent(question: str):
-    tools = [get_product_price, apply_discount]
-    tools_dict = {
+tools = {
         "get_product_price":get_product_price,
         "apply_discount":apply_discount
     }
 
+def get_tool_descriptions(tools_dict):
+    descriptions=[]
+    for tool_name,tool_func in tools_dict.items():
+        original_func=getattr(tool_func,"__wrapped__",tool_func)
+        signature=inspect.signature(original_func)
+        docstring=inspect.getdoc(tool_func)
+        descriptions.append(f"{tool_name}{signature} - {docstring}")
+    return "\n".join(descriptions)
+
+tool_descriptions = get_tool_descriptions(tools)
+tool_names = ", ".join(tools.keys())
 
 
-    messages = [
-        {"role":"system","content":(
-                "You are a helpful shopping assistant. "
-                "You have access to a product catalog tool "
-                "and a discount tool.\n\n"
-                "STRICT RULES — you must follow these exactly:\n"
-                "1. NEVER guess or assume any product price. "
-                "You MUST call get_product_price first to get the real price.\n"
-                "2. Only call apply_discount AFTER you have received "
-                "a price from get_product_price. Pass the exact price "
-                "returned by get_product_price — do NOT pass a made-up number.\n"
-                "3. NEVER calculate discounts yourself using math. "
-                "Always use the apply_discount tool.\n"
-                "4. If the user does not specify a discount tier, "
-                "ask them which tier to use — do NOT assume one."
-            )},
-        {"role":"user","content":question},
-    ]
+react_prompt = f"""
+STRICT RULES — you must follow these exactly:
+1. NEVER guess or assume any product price. You MUST call get_product_price first to get the real price.
+2. Only call apply_discount AFTER you have received a price from get_product_price. Pass the exact price returned by get_product_price — do NOT pass a made-up number.
+3. NEVER calculate discounts yourself using math. Always use the apply_discount tool.
+4. If the user does not specify a discount tier, ask them which tier to use — do NOT assume one.
+
+Answer the following questions as best you can. You have access to the following tools:
+
+{tool_descriptions}
+
+Use the following format:
+
+Question: the input question you must answer
+Thought: you should always think about what to do
+Action: the action to take, should be one of [{tool_names}]
+Action Input: the input to the action, as comma separated values
+Observation: the result of the action
+... (this Thought/Action/Action Input/Observation can repeat N times)
+Thought: I now know the final answer
+Final Answer: the final answer to the original input question
+
+Begin!
+
+Question: {{question}}
+Thought:"""
+
+@traceable(name="LLM chat",run_type="llm")
+def nematron_chat_traced(messages,stop,temperature):
+    return llm.chat.completions.create(
+    model=model,
+    messages=messages,
+    stop=stop,
+    temperature=temperature
+)
+
+@traceable(name="Agent Loop")
+def run_agent(question: str):
+
+    prompt = react_prompt.format(question=question)
+    scratchpad=""
+
     for _ in range(MAX_ITERATIONS):
-        response=nematron_chat_traced(messages)
-        ai_message = response.choices[0].message
-        tool_calls=ai_message.tool_calls
-        if not tool_calls:
-            return ai_message.content  # Final answer from the model
-        for tool_call in tool_calls:
-            tool_name = tool_call.function.name
-            tool_args = json.loads(tool_call.function.arguments)
+        full_prompt=prompt+scratchpad
 
-            tool_to_call = tools_dict.get(tool_name)
-            if tool_to_call:
-                tool_result = tool_to_call(**tool_args)
-                messages.append(ai_message)  # Add the model's message that included the tool call
-                messages.append({
-                    "role":"tool",
-                    "content":str(tool_result),
-                    "tool_call_id":tool_call.id,
-                })
-            else:
-                raise ValueError(f"Model tried to call unknown tool: {tool_name}")
-    raise RuntimeError("Model did not arrive at a final answer within the iteration limit.")
+        response = nematron_chat_traced(
+        messages=[{"role": "user", "content": full_prompt}],
+        stop=["Observation:", "\nObservation:", "Observation"], # Cover all bases
+        temperature=0
+        )
+
+        output = response.choices[0].message.content
+
+        final_answer_match = re.search(r"Final Answer:\s*(.+)", output)
+        if final_answer_match:
+            final_answer = final_answer_match.group(1).strip()
+            return final_answer
+
+        action_match = re.search(r"Action:\s*(.+)", output)
+        action_input_match = re.search(r"Action Input:\s*(.+)", output)
+
+        if not action_match or not action_input_match:
+            print(
+                "  [Parsing] ERROR: Could not parse Action/Action Input from LLM output"
+            )
+            break
+
+        tool_name = action_match.group(1).strip()
+        tool_input_raw = action_input_match.group(1).strip()
+
+
+        raw_args = [x.strip() for x in tool_input_raw.split(",")]
+        args = [x.split("=", 1)[-1].strip().strip("'\"") for x in raw_args]
+
+        if tool_name not in tools:
+            observation = f"Error: Tool '{tool_name}' not found. Available tools: {list(tools.keys())}"
+        else:
+            observation = str(tools[tool_name](*args))
+
+        scratchpad += f"{output}\nObservation: {observation}\nThought:"
+
+    return None
 
 if __name__ == "__main__":
     question = "What is the price of a laptop after applying a gold discount?"
