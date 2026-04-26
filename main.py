@@ -1,8 +1,6 @@
+import json
 import os
-
-from langchain.chat_models import init_chat_model
-from langchain.tools import tool
-from langchain_core.messages import HumanMessage, SystemMessage,ToolMessage
+from openai import OpenAI
 from langsmith import traceable
 from dotenv import load_dotenv
 load_dotenv()
@@ -10,8 +8,12 @@ load_dotenv()
 MAX_ITERATIONS = 5
 model = "nvidia/nemotron-3-super-120b-a12b-20230311:free"
 
+llm=OpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=os.getenv("OPENROUTER_API_KEY"),
+)
 
-@tool
+@traceable(run_type="tool")
 def get_product_price(product_name: str) -> float:
     """Look up the price of a product in a catalog."""
     prices = {
@@ -21,7 +23,7 @@ def get_product_price(product_name: str) -> float:
     }
     return prices.get(product_name, 0.0)
 
-@tool
+@traceable(run_type="tool")
 def apply_discount(price: float, discount_tier: str) -> float:
     """Apply a discount to a price.
     Available tiers: bronze (5%), silver (10%), gold (15%)"""
@@ -31,25 +33,67 @@ def apply_discount(price: float, discount_tier: str) -> float:
         "gold": 15,
     }
     discount_percentage = discount_tiers.get(discount_tier, 0)
-    return price * (1 - discount_percentage / 100)
+    return round(price * (1 - discount_percentage / 100), 2)
 
-@traceable(name="Langchain Agent Loop")
+tools_for_llm = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_product_price",
+            "description": "Look up the price of a product in a catalog.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "product_name": {
+                        "type": "string",
+                        "description": "The product name, e.g. 'laptop', 'headphones', 'keyboard'",
+                    },
+                },
+                "required": ["product_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "apply_discount",
+            "description": """Apply a discount to a price.
+    Available tiers: bronze (5%), silver (10%), gold (15%)""",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "price": {"type": "number", "description": "The original price"},
+                    "discount_tier": {
+                        "type": "string",
+                        "description": "The discount tier: 'bronze', 'silver', or 'gold'",
+                    },
+                },
+                "required": ["price", "discount_tier"],
+            },
+        },
+    },
+]
+
+@traceable(name="Nematron chat",run_type="llm")
+def nematron_chat_traced(messages):
+    return llm.chat.completions.create(
+    model="nvidia/nemotron-3-super-120b-a12b:free",
+    messages=messages,
+    tools=tools_for_llm,
+)
+
+@traceable(name="Nematron Agent Loop")
 def run_agent(question: str):
     tools = [get_product_price, apply_discount]
-    tools_dict = {tool.name: tool for tool in tools}
+    tools_dict = {
+        "get_product_price":get_product_price,
+        "apply_discount":apply_discount
+    }
 
-    llm = init_chat_model(
-    model="nvidia/nemotron-3-super-120b-a12b:free",
-    model_provider="openai",
-    base_url="https://openrouter.ai/api/v1",
-    api_key=os.getenv("OPENROUTER_API_KEY"),
-    # This enables the reasoning feature in the API call
-    # model_kwargs={"extra_body": {"reasoning": {"enabled": True}}}
-)
-    llm_with_tools = llm.bind_tools(tools)
+
 
     messages = [
-        SystemMessage(content=(
+        {"role":"system","content":(
                 "You are a helpful shopping assistant. "
                 "You have access to a product catalog tool "
                 "and a discount tool.\n\n"
@@ -63,22 +107,27 @@ def run_agent(question: str):
                 "Always use the apply_discount tool.\n"
                 "4. If the user does not specify a discount tier, "
                 "ask them which tier to use — do NOT assume one."
-            )),
-        HumanMessage(content=question),
+            )},
+        {"role":"user","content":question},
     ]
-    for iterations in range(MAX_ITERATIONS):
-        ai_message = llm_with_tools.invoke(messages)
-        tool_calls= ai_message.tool_calls
+    for _ in range(MAX_ITERATIONS):
+        response=nematron_chat_traced(messages)
+        ai_message = response.choices[0].message
+        tool_calls=ai_message.tool_calls
         if not tool_calls:
             return ai_message.content  # Final answer from the model
         for tool_call in tool_calls:
-            tool_name = tool_call.get("name")
-            tool_args = tool_call.get("args", {})
+            tool_name = tool_call.function.name
+            tool_args = json.loads(tool_call.function.arguments)
+
             tool_to_call = tools_dict.get(tool_name)
             if tool_to_call:
-                tool_result = tool_to_call.invoke(tool_args)
+                tool_result = tool_to_call(**tool_args)
                 messages.append(ai_message)  # Add the model's message that included the tool call
-                messages.append(ToolMessage(content=str(tool_result), tool_call_id=tool_call.get("id")))
+                messages.append({
+                    "role":"tool",
+                    "content":str(tool_result)
+                })
             else:
                 raise ValueError(f"Model tried to call unknown tool: {tool_name}")
     raise RuntimeError("Model did not arrive at a final answer within the iteration limit.")
