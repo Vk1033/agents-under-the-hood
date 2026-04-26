@@ -126,7 +126,8 @@ def run_agent(question: str):
                 messages.append(ai_message)  # Add the model's message that included the tool call
                 messages.append({
                     "role":"tool",
-                    "content":str(tool_result)
+                    "content":str(tool_result),
+                    "tool_call_id":tool_call.id,
                 })
             else:
                 raise ValueError(f"Model tried to call unknown tool: {tool_name}")
